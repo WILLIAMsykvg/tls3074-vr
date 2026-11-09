@@ -131,6 +131,40 @@ canvas { display: block; position: fixed; inset: 0; }
   line-height: 1.45;
 }
 
+#live {
+  display: none;
+  position: fixed;
+  left: 14px;
+  top: 84px;
+  align-items: center;
+  gap: 8px;
+  background: rgba(127, 29, 29, 0.92);
+  border: 1px solid #f87171;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: clamp(13px, 1.15vw, 19px);
+  z-index: 6;
+}
+
+#live .rec {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 10px #ef4444;
+  animation: blink 1.2s infinite;
+}
+
+#liveLag { color: #fecaca; margin-left: 4px; }
+
+@keyframes blink { 50% { opacity: 0.25; } }
+
+body.pov #live { display: flex; }
+body.pov #caption { width: min(64vw, 1100px); padding: 7px 16px 9px; background: rgba(15, 23, 42, 0.8); }
+body.pov #capMain { font-size: clamp(15px, 1.55vw, 26px); }
+body.pov #capSub { font-size: clamp(12px, 1.1vw, 19px); }
+body.pov #capSub2, body.pov #dots { display: none; }
+
 #vrbox {
   position: fixed;
   top: 96px;

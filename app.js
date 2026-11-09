@@ -7,6 +7,14 @@ const ROOM = (query.get('room') || '').replace(/[^-_A-Za-z0-9]/g, '').slice(0, 6
 const RELAY = 'https://ntfy.sh/' + ROOM;
 const APP_TAG = 'tls3074g7';
 const MY_ID = Math.random().toString(36).slice(2, 10);
+const POSE_TOPIC = `tls3074g7/${ROOM}/pose`;
+// broker.emqx.io drops messages above roughly 5 per second, so it only carries a slower backup copy.
+const BROKERS = [
+  { name: 'cn', url: 'wss://broker-cn.emqx.io:8084/mqtt', every: 1 },
+  { name: 'global', url: 'wss://broker.emqx.io:8084/mqtt', every: 3 },
+];
+const POSE_HZ = 12;
+const BUFFER_MS = 90;
 const FONT = 'system-ui, "Segoe UI", Roboto, "Noto Sans", Arial, sans-serif';
 
 const HEX = { B: 0x2563eb, I: 0xf97316, F: 0xdc2626 };
@@ -648,7 +656,7 @@ function setStep(i, { publish = true, instant = false, from = null } = {}) {
   updateOverlay(i);
   const mode = STEPS[i].mode;
   if (instant || mode !== presetName) {
-    goPreset(mode, instant ? 0 : 1.6);
+    if (!povActive) goPreset(mode, instant ? 0 : 1.6);
     presetName = mode;
   }
   if (publish) publishStep(i);
@@ -768,6 +776,234 @@ function startRelay() {
   es.onmessage = onRelayMessage;
 }
 
+// ---------- live head view: headset sends its pose, the big screen renders from it ----------
+
+const poseLinks = [];
+let povActive = false;
+let followPOV = true;
+
+function startPoseLinks() {
+  const lib = window.mqtt;
+  if (!lib || typeof lib.connect !== 'function') return;
+  for (const b of BROKERS) {
+    const link = { name: b.name, every: b.every, up: false, client: null };
+    try {
+      link.client = lib.connect(b.url, {
+        clientId: `g7${ROLE[0]}-${MY_ID}-${b.name}`,
+        clean: true,
+        connectTimeout: 8000,
+        reconnectPeriod: 3000,
+        keepalive: 20,
+      });
+    } catch (e) {
+      continue;
+    }
+    link.client.on('connect', () => {
+      link.up = true;
+      if (ROLE === 'screen') link.client.subscribe(POSE_TOPIC, { qos: 0 });
+      updateViewButton();
+    });
+    link.client.on('close', () => { link.up = false; updateViewButton(); });
+    link.client.on('offline', () => { link.up = false; });
+    link.client.on('error', () => {});
+    if (ROLE === 'screen') link.client.on('message', (topic, payload) => onPose(payload));
+    poseLinks.push(link);
+  }
+}
+
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const r4 = (v) => Math.round(v * 10000) / 10000;
+const packPose = (p, q) => [r3(p.x), r3(p.y), r3(p.z), r4(q.x), r4(q.y), r4(q.z), r4(q.w)];
+
+let poseSeq = 0;
+let lastPoseSent = -1;
+const _hp = new THREE.Vector3();
+const _hq = new THREE.Quaternion();
+const _hs = new THREE.Vector3();
+
+function sendPose(headPos, headQuat, ctrls) {
+  if (!poseLinks.some((L) => L.up)) return;
+  poseSeq += 1;
+  const msg = JSON.stringify({
+    id: MY_ID,
+    n: poseSeq,
+    t: Date.now(),
+    h: packPose(headPos, headQuat),
+    r: [r3(rig.position.x), r3(rig.position.y), r3(rig.position.z), r4(rig.rotation.y), r3(stand.visible ? stand.scale.y : 0)],
+    c: ctrls,
+  });
+  for (const L of poseLinks) {
+    if (L.up && poseSeq % L.every === 0) L.client.publish(POSE_TOPIC, msg, { qos: 0 });
+  }
+}
+
+function sendXRPose() {
+  renderer.xr.getCamera().matrixWorld.decompose(_hp, _hq, _hs);
+  const ctrls = [];
+  for (let i = 0; i < 2; i++) {
+    const ctl = renderer.xr.getController(i);
+    ctrls.push(ctl.visible ? [1, ...packPose(ctl.position, ctl.quaternion)] : [0]);
+  }
+  sendPose(_hp, _hq, ctrls);
+}
+
+// Test helper: the headset page sends a made-up head path without a headset.
+let simUntil = -1;
+const _se = new THREE.Vector3();
+const _sl = new THREE.Vector3();
+const _sc = new THREE.Vector3();
+const _sm = new THREE.Matrix4();
+const _sq = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+function sendSimPose(t) {
+  rig.position.set(0, 0.95, -0.68);
+  rig.rotation.set(0, 0, 0);
+  setStand(0.909);
+  _se.set(0.14 * Math.sin(0.9 * t), 1.47 + 0.03 * Math.sin(1.3 * t), 0.05 * Math.cos(0.9 * t));
+  _sl.set(0.18 * Math.sin(0.6 * t), 0.98 + 0.08 * Math.sin(0.4 * t), -0.68);
+  _sm.lookAt(_se, _sl, _up);
+  _sq.setFromRotationMatrix(_sm);
+  _sc.set(_se.x + 0.18, _se.y - 0.32 + 0.05 * Math.sin(2 * t), _se.z - 0.28);
+  sendPose(_se, _sq, [[1, ...packPose(_sc, _sq)], [0]]);
+}
+
+const poseBuf = [];
+const offsets = [];
+const lagSamples = [];
+let poseSender = null;
+let lastPoseN = 0;
+let lastPoseAt = -1e9;
+let baseOffset = 0;
+let lagShownAt = 0;
+
+function onPose(payload) {
+  let p;
+  try { p = JSON.parse(payload.toString()); } catch (e) { return; }
+  if (!p || !Array.isArray(p.h) || p.h.length !== 7 || !Array.isArray(p.r)) return;
+  if (p.id !== poseSender) {
+    poseSender = p.id;
+    lastPoseN = 0;
+    poseBuf.length = 0;
+    offsets.length = 0;
+  }
+  if (p.n <= lastPoseN) return;
+  lastPoseN = p.n;
+  const local = performance.now();
+  lastPoseAt = local;
+  offsets.push(local - p.t);
+  if (offsets.length > 40) offsets.shift();
+  baseOffset = Math.min(...offsets);
+  lagSamples.push(Date.now() - p.t);
+  if (lagSamples.length > 12) lagSamples.shift();
+  poseBuf.push({
+    t: p.t,
+    pos: new THREE.Vector3(p.h[0], p.h[1], p.h[2]),
+    quat: new THREE.Quaternion(p.h[3], p.h[4], p.h[5], p.h[6]),
+    r: p.r,
+    c: Array.isArray(p.c) ? p.c : [],
+  });
+  if (poseBuf.length > 40) poseBuf.shift();
+}
+
+function updateViewButton() {
+  const btn = $('btnView');
+  if (!btn) return;
+  if (!followPOV) btn.textContent = 'Headset view: off';
+  else if (povActive) btn.textContent = 'Headset view: LIVE';
+  else btn.textContent = poseLinks.some((L) => L.up) ? 'Headset view: waiting' : 'Headset view: no link';
+}
+
+function enterPOV() {
+  povActive = true;
+  document.body.classList.add('pov');
+  controls.enabled = false;
+  camTween = null;
+  camera.fov = 58;
+  camera.updateProjectionMatrix();
+  board.visible = true;
+  updateViewButton();
+}
+
+function exitPOV() {
+  povActive = false;
+  document.body.classList.remove('pov');
+  controls.enabled = true;
+  camera.fov = 40;
+  camera.updateProjectionMatrix();
+  board.visible = false;
+  remoteCtl.forEach((g) => { g.visible = false; });
+  layout2D();
+  presetName = STEPS[stepIdx].mode;
+  goPreset(presetName, 0);
+  updateViewButton();
+}
+
+const _cv = new THREE.Vector3();
+const _cq = new THREE.Quaternion();
+function updatePOV(dt) {
+  const live = followPOV && poseBuf.length > 0 && performance.now() - lastPoseAt < 3000;
+  if (live && !povActive) enterPOV();
+  if (!live && povActive) exitPOV();
+  if (!povActive) return;
+
+  // Render a little behind the newest sample so that late packets can still be interpolated.
+  const rt = performance.now() - baseOffset - BUFFER_MS;
+  let a = poseBuf[poseBuf.length - 1];
+  let b = a;
+  if (rt <= poseBuf[0].t) {
+    a = b = poseBuf[0];
+  } else {
+    for (let k = poseBuf.length - 1; k > 0; k--) {
+      if (poseBuf[k - 1].t <= rt) {
+        a = poseBuf[k - 1];
+        b = poseBuf[k];
+        break;
+      }
+    }
+  }
+  const u = a === b ? 1 : Math.min(1, Math.max(0, (rt - a.t) / (b.t - a.t)));
+  camera.position.lerpVectors(a.pos, b.pos, u);
+  camera.quaternion.slerpQuaternions(a.quat, b.quat, u);
+
+  const r = b.r;
+  rig.position.set(r[0], r[1], r[2]);
+  rig.rotation.set(0, r[3], 0);
+  setStand(r[4] || 0);
+  floor.position.y = 0;
+
+  const alpha = 1 - Math.exp(-dt / 0.05);
+  for (let i = 0; i < 2; i++) {
+    const d = b.c[i];
+    const g = remoteCtl[i];
+    if (d && d[0] === 1 && d.length === 8) {
+      _cv.set(d[1], d[2], d[3]);
+      _cq.set(d[4], d[5], d[6], d[7]);
+      if (!g.visible) {
+        g.position.copy(_cv);
+        g.quaternion.copy(_cq);
+      }
+      g.visible = true;
+      g.position.lerp(_cv, alpha);
+      g.quaternion.slerp(_cq, alpha);
+    } else {
+      g.visible = false;
+    }
+  }
+
+  if (performance.now() - lagShownAt > 500) {
+    lagShownAt = performance.now();
+    const s = lagSamples.slice().sort((x, y) => x - y);
+    const lag = s.length ? s[Math.floor(s.length / 2)] + BUFFER_MS : NaN;
+    $('liveLag').textContent = lag > 0 && lag < 5000 ? ` · delay ≈ ${(lag / 1000).toFixed(2)} s` : '';
+  }
+}
+
+function toggleFollow() {
+  followPOV = !followPOV;
+  if (!followPOV && povActive) exitPOV();
+  updateViewButton();
+}
+
 // ---------- headset: VR session, input, recentring ----------
 
 let xrSession = null;
@@ -784,11 +1020,24 @@ function vrNav(delta) {
   setStep(stepIdx + delta);
 }
 
+const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.18)]);
+const rayMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
+const tipGeo = new THREE.SphereGeometry(0.011, 12, 10);
+const tipMat = new THREE.MeshBasicMaterial({ color: 0xfbbf24 });
+
+const remoteCtl = [];
+if (ROLE === 'screen') {
+  for (let i = 0; i < 2; i++) {
+    const g = new THREE.Group();
+    g.add(new THREE.Line(rayGeo, rayMat));
+    g.add(new THREE.Mesh(tipGeo, tipMat));
+    g.visible = false;
+    scene.add(g);
+    remoteCtl.push(g);
+  }
+}
+
 if (ROLE === 'headset') {
-  const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.18)]);
-  const rayMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
-  const tipGeo = new THREE.SphereGeometry(0.011, 12, 10);
-  const tipMat = new THREE.MeshBasicMaterial({ color: 0xfbbf24 });
   for (let i = 0; i < 2; i++) {
     const ctl = renderer.xr.getController(i);
     ctl.addEventListener('selectstart', () => vrNav(1));
@@ -931,6 +1180,9 @@ window.addEventListener('keydown', (e) => {
   } else if (['f', 'F'].includes(k)) {
     e.preventDefault();
     toggleFullscreen();
+  } else if (['v', 'V'].includes(k) && ROLE === 'screen') {
+    e.preventDefault();
+    toggleFollow();
   }
 });
 
@@ -946,6 +1198,7 @@ onButton('btnNext', () => setStep(stepIdx + 1));
 onButton('btnBack', () => setStep(stepIdx - 1));
 onButton('btnRestart', () => setStep(0));
 onButton('btnFull', toggleFullscreen);
+onButton('btnView', toggleFollow);
 
 // ---------- loop ----------
 
@@ -955,14 +1208,15 @@ renderer.setAnimationLoop(() => {
   now += dt;
   const inXR = renderer.xr.isPresenting;
 
-  if (camTween && !inXR) {
+  if (camTween && !inXR && !povActive) {
     const u = Math.min(1, (now - camTween.t0) / camTween.dur);
     const e = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
     camera.position.lerpVectors(camTween.fp, camTween.tp, e);
     controls.target.lerpVectors(camTween.ft, camTween.tt, e);
     if (u >= 1) camTween = null;
   }
-  if (!inXR) controls.update();
+  if (!inXR && !povActive) controls.update();
+  if (ROLE === 'screen') updatePOV(dt);
 
   for (const A of allAnims) A.update(dt, now);
 
@@ -991,6 +1245,18 @@ renderer.setAnimationLoop(() => {
     decorateHands();
     maybeRecenter();
   }
+  if (now - lastPoseSent >= 1 / POSE_HZ) {
+    if (inXR) {
+      lastPoseSent = now;
+      sendXRPose();
+    } else if (now < simUntil) {
+      lastPoseSent = now;
+      sendSimPose(now);
+    } else if (simUntil > 0) {
+      simUntil = -1;
+      if (!povActive) layout2D();
+    }
+  }
   renderer.render(scene, camera);
 });
 
@@ -1008,7 +1274,18 @@ window.__g7 = {
     controls.target.set(0, 0.45, -0.44);
     controls.update();
   },
+  simPose(seconds = 20) { simUntil = now + seconds; },
+  get pov() {
+    return {
+      active: povActive,
+      links: poseLinks.map((L) => `${L.name}:${L.up ? 'up' : 'down'}`),
+      buffered: poseBuf.length,
+      lagMs: lagSamples.length ? lagSamples.slice().sort((x, y) => x - y)[Math.floor(lagSamples.length / 2)] : null,
+      sent: poseSeq,
+    };
+  },
 };
 
 setStep(0, { publish: false, instant: true });
 startRelay();
+startPoseLinks();

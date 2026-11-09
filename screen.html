@@ -6,6 +6,7 @@
 <title>Group 7 · Big screen · See the force in 3D</title>
 <link rel="stylesheet" href="./style.css">
 <script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
+<script src="./vendor/mqtt.min.js"></script>
 </head>
 <body data-role="screen">
   <header id="topbar">
@@ -21,8 +22,11 @@
     <button id="btnNext">Next ▶</button>
     <button id="btnRestart">Restart</button>
     <button id="btnFull">Full screen</button>
-    <div class="keys">→ / Space: next<br>← : back<br>R: restart<br>F: full screen<br>Drag to turn the view</div>
+    <button id="btnView">Headset view: waiting</button>
+    <div class="keys">→ / Space: next<br>← : back<br>R: restart<br>F: full screen<br>V: headset view on / off<br>Drag to turn the view</div>
   </nav>
+
+  <div id="live"><span class="rec"></span><b>LIVE</b>&nbsp;· headset view<span id="liveLag"></span></div>
 
   <footer id="caption">
     <div id="capTitle"></div>
