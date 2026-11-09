@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Group 7 · Big screen · See the force in 3D</title>
+<link rel="stylesheet" href="./style.css">
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
+</head>
+<body data-role="screen">
+  <header id="topbar">
+    <div class="brand">TLS3074 · Group 7 · See the force in 3D<small>Big screen · follows the headset live</small></div>
+    <div class="right">
+      <div id="legend"><span class="lg b">B field</span><span class="lg i">I current</span><span class="lg f">F force</span></div>
+      <div id="link" class="chip retry">Connecting…</div>
+    </div>
+  </header>
+
+  <nav id="nav">
+    <button id="btnBack">◀ Back</button>
+    <button id="btnNext">Next ▶</button>
+    <button id="btnRestart">Restart</button>
+    <button id="btnFull">Full screen</button>
+    <div class="keys">→ / Space: next<br>← : back<br>R: restart<br>F: full screen<br>Drag to turn the view</div>
+  </nav>
+
+  <footer id="caption">
+    <div id="capTitle"></div>
+    <div id="capMain"></div>
+    <div id="capSub"></div>
+    <div id="capSub2"></div>
+    <div id="dots"></div>
+  </footer>
+
+  <noscript>This page needs JavaScript.</noscript>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
